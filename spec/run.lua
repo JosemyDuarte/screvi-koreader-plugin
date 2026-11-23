@@ -6,6 +6,7 @@ package.path = "./?.lua;" .. package.path
 local temp_root = os.getenv("TMPDIR") or "/tmp"
 math.randomseed(os.time())
 local temp_dir = temp_root:gsub("/$", "") .. "/screvi-spec-" .. os.time() .. "-" .. math.random(1, 2147483647)
+if arg[1] == "--date-regression" then temp_dir = temp_dir .. "-" .. assert(os.getenv("TZ")):gsub("/", "-") end
 assert(os.execute("mkdir -p '" .. temp_dir:gsub("'", "'\\''") .. "'") == 0)
 local failures, passed = 0, 0
 local function check(cond, msg)
@@ -238,6 +239,41 @@ eq(Screvi.parseIsbn("urn:isbn:080442957X"), "080442957X", "isbn-10 with X")
 local iso = Screvi.toIsoDate("2024-03-01 09:05:00")
 check(iso and iso:match("^2024%-0[23]%-%d%dT%d%d:05:00Z$"), "iso date " .. tostring(iso))
 eq(Screvi.toIsoDate("garbage"), nil, "bad date -> nil")
+
+-- Start fresh LuaJIT processes: the C runtime may cache the process timezone.
+if arg[1] == "--date-regression" then
+    local zone = assert(os.getenv("TZ"))
+    local stockholm = zone == "Europe/Stockholm"
+    local fixtures = {
+        { "2026-11-23 19:52:35", "2026-11-23T19:52:35Z", "2026-11-23T18:52:35Z" },
+        { "2026-07-23 19:52:35", "2026-07-23T19:52:35Z", "2026-07-23T17:52:35Z" },
+        { "2026-01-02 00:30:00", "2026-01-02T00:30:00Z", "2026-01-01T23:30:00Z" },
+        { "2026-07-02 00:30:00", "2026-07-02T00:30:00Z", "2026-07-01T22:30:00Z" },
+        { "2026-03-29 01:30:00", "2026-03-29T01:30:00Z", "2026-03-29T00:30:00Z" },
+        { "2026-03-29 03:30:00", "2026-03-29T03:30:00Z", "2026-03-29T01:30:00Z" },
+        { "2026-10-25 01:30:00", "2026-10-25T01:30:00Z", "2026-10-24T23:30:00Z" },
+        { "2026-10-25 03:30:00", "2026-10-25T03:30:00Z", "2026-10-25T02:30:00Z" },
+    }
+    for _, fixture in ipairs(fixtures) do
+        eq(Screvi.toIsoDate(fixture[1]), fixture[stockholm and 3 or 2], zone .. " local date " .. fixture[1])
+    end
+    local exported = require("screvi_exporter").createSource({ title = "Dates", {
+        { text = "Winter", time = 1795463555 }, { text = "Summer", time = 1784836355 },
+    } })
+    eq(exported.highlights[1].date, "2026-11-23T19:52:35Z", zone .. " exporter winter timestamp")
+    eq(exported.highlights[2].date, "2026-07-23T19:52:35Z", zone .. " exporter summer timestamp")
+    print(string.format("%d passed, %d failed", passed, failures))
+    assert(os.execute("rm -rf '" .. temp_dir:gsub("'", "'\\''") .. "'") == 0)
+    os.exit(failures == 0 and 0 or 1)
+end
+for _, zone in ipairs({ "UTC", "Europe/Stockholm" }) do
+    local proc = assert(io.popen("TZ=" .. zone .. " luajit spec/run.lua --date-regression 2>&1"))
+    local result = proc:read("*a")
+    proc:close()
+    local count, failed = result:match("(%d+) passed, (%d+) failed")
+    check(count and failed == "0", zone .. " date regressions: " .. result)
+    if count then passed = passed + tonumber(count); failures = failures + tonumber(failed) end
+end
 
 -- modern parsing
 local book = Screvi.getBookFromSidecar("/books/Meditations.epub")
@@ -518,7 +554,7 @@ check(zip["META-INF/container.xml"]:find("OEBPS/content.opf", 1, true), "contain
 for _, text in ipairs({ "<dc:title>Title &amp; words</dc:title>", "<dc:creator>Author</dc:creator>", "<dc:source>https://example.com/posts/article</dc:source>", '<dc:identifier id="bookid">1234-uuid</dc:identifier>' }) do
     check(zip["OEBPS/content.opf"]:find(text, 1, true), "OPF metadata " .. text)
 end
-check(zip["OEBPS/content.xhtml"]:find("2026-01-02", 1, true), "saved date in header")
+check(zip["OEBPS/content.xhtml"]:find("<p>2 Jan 2026</p>", 1, true), "human saved date in header")
 check(zip["OEBPS/content.xhtml"]:find("<br/>", 1, true), "void elements closed")
 check(zip["OEBPS/images/1.png"] and zip["OEBPS/images/2.jpg"], "images bundled")
 eq(image_urls[1], "https://example.com/lead.png", "root relative cover URL")
@@ -542,9 +578,9 @@ ap = resetArticlePlugin()
 local file = trackedArticle(ap, "article-1", "complete")
 http_responses = { response(201, { data = {} }), response(200, { data = { home_status = "archive" } }) }
 local real_request = ap.requestJson
-ap.requestJson = function(self, method, url, body, auth)
+ap.requestJson = function(self, method, url, ...)
     events[#events + 1] = method .. ":" .. url
-    return real_request(self, method, url, body, auth)
+    return real_request(self, method, url, ...)
 end
 check(ap.articles:finish("article-1"), "finished article archived")
 eq(http_log[1].method, "POST", "highlights before PATCH")
@@ -1195,6 +1231,56 @@ eq(Epub.xhtml([[<p>one</p><script>if (a < b) { x = "unterminated; }</ScRiPt><p>t
     "<p>one</p><p>two</p>", "raw script scan ignores quotes and comparisons")
 eq(Epub.xhtml([[<p>one < 'quoted text</p><p>two</p>]], {}),
     "<p>one &lt; 'quoted text</p><p>two</p>", "stray less-than remains text")
+
+-- EPUB 2 uses XHTML 1.1: translate HTML5 containers and keep only legal attributes.
+for _, tag in ipairs({ "figure", "article", "section", "header", "footer", "aside", "nav", "main", "hgroup", "details", "summary" }) do
+    eq(Epub.xhtml("<" .. tag .. ' hidden="hidden"><p>Text</p></' .. tag .. ">", {}),
+        "<div><p>Text</p></div>", tag .. " maps to div")
+end
+eq(Epub.xhtml('<figure><figcaption class="arbitrary">Caption &amp; text</figcaption></figure>', {}),
+    '<div><div class="caption">Caption &amp; text</div></div>', "caption gets XHTML div and fixed class")
+eq(Epub.xhtml('<mark>Marked</mark><time datetime="2026-01-02">Today</time>', {}),
+    "<span>Marked</span><span>Today</span>", "HTML5 inline elements map to span")
+eq(Epub.xhtml('<div><section>Inside</section>Outside</div>', {}),
+    "<div><div>Inside</div>Outside</div>", "mapped closing tag preserves parent container")
+eq(Epub.xhtml('<section><div>Inside</div>Outside</section>', {}),
+    "<div><div>Inside</div>Outside</div>", "native closing tag preserves mapped parent")
+eq(Epub.xhtml('<div><section/>Outside<mark/>Tail</div>', {}),
+    "<div><div></div>Outside<span></span>Tail</div>", "self-closing mapped elements do not swallow following content")
+eq(Epub.xhtml('<u>Underlined</u><s>Struck</s><font color="red">Font</font><video>Video</video><p-widget>Custom</p-widget>', {}),
+    "UnderlinedStruckFontVideoCustom", "unsupported and legacy tags retain text only")
+eq(Epub.xhtml('<p colspan="4" href="/bad" style="color:red" onclick="bad()">Text</p><div src="/bad">Div</div><a alt="bad" href="/ok">Link</a>', { url = "https://example.com" }),
+    '<p>Text</p><div>Div</div><a href="https://example.com/ok">Link</a>', "attributes restricted by element")
+eq(Epub.xhtml('<table><tr><th colspan="4">PHASE 0 — orientation</th></tr><tr><td rowspan="2" colspan="3">Cell</td></tr></table>', {}),
+    '<table><tr><th colspan="4">PHASE 0 — orientation</th></tr><tr><td colspan="3" rowspan="2">Cell</td></tr></table>', "table cell spans preserved")
+for _, value in ipairs({ "0", "-1", "1.5", "1e2", "2px", "", " 2" }) do
+    eq(Epub.xhtml('<table><tr><td colspan="' .. value .. '" rowspan="' .. value .. '">Cell</td></tr></table>', {}),
+        "<table><tr><td>Cell</td></tr></table>", "invalid table span rejected: " .. value)
+end
+eq(Epub.xhtml('<table><tr><td colspan="1001" rowspan="999999999999999999999999999999">Cell</td><th colspan="0004" rowspan="1000">Heading</th></tr></table>', {}),
+    '<table><tr><td colspan="1000" rowspan="1000">Cell</td><th colspan="4" rowspan="1000">Heading</th></tr></table>', "table spans capped and normalized")
+eq(Epub.xhtml('<table><tr><td colspan="&#52;" onclick="bad()" rowspan=2>Cell</td></tr></table>', {}),
+    '<table><tr><td colspan="4" rowspan="2">Cell</td></tr></table>', "encoded and unquoted cell spans retained without event attributes")
+
+local function builtHeader(metadata)
+    metadata.id, metadata.title, metadata.content = "header", "Header & title", "<p>Body</p>"
+    check(Epub.build(metadata, epub_path), "header fixture builds")
+    local xhtml
+    for _, entry in ipairs(zip_entries) do if entry.path == "OEBPS/content.xhtml" then xhtml = entry.data end end
+    os.remove(epub_path)
+    return xhtml:match('(<h1>.-</div>)'), xhtml
+end
+local header, header_xhtml = builtHeader({ author = " Writer & co ", site_name = "Site", source_domain = "example.com", published_date = "2026-11-23T19:48:30.164Z", saved_at = "2026-01-02", url = "https://example.com/?a=1&b=2" })
+eq(header, '<h1>Header &amp; title</h1><div class="header"><p>Writer &amp; co · Site</p><p>23 Nov 2026</p><p><a href="https://example.com/?a=1&amp;b=2">https://example.com/?a=1&amp;b=2</a></p></div>', "header has byline, publication date, then URL")
+check(header_xhtml:find('.header p { text-indent: 0; margin: 0; font-size: small; }', 1, true), "header paragraph CSS overrides reader defaults")
+check(header_xhtml:find('.caption { font-size: small; text-align: center; }', 1, true), "caption CSS is small and centered")
+check(header_xhtml:find('img { max-width: 100%; }', 1, true), "responsive image CSS retained")
+eq(builtHeader({ source_domain = "example.com", saved_at = "2026-11-23T19:48:30.164Z" }),
+    '<h1>Header &amp; title</h1><div class="header"><p>example.com</p><p>23 Nov 2026</p></div>', "missing author and URL leave no blank lines")
+eq(builtHeader({ author = "Writer", site_name = " ", source_domain = "example.com" }),
+    '<h1>Header &amp; title</h1><div class="header"><p>Writer · example.com</p></div>', "blank site name falls back to domain")
+eq(builtHeader({ author = "Writer" }), '<h1>Header &amp; title</h1><div class="header"><p>Writer</p></div>', "author-only header has no separator")
+eq(builtHeader({ author = " ", saved_at = "bad-date" }), '<h1>Header &amp; title</h1><div class="header"></div>', "missing metadata has no empty paragraphs or raw date")
 
 print(string.format("%d passed, %d failed", passed, failures))
 assert(os.execute("rm -rf '" .. temp_dir:gsub("'", "'\\''") .. "'") == 0)
