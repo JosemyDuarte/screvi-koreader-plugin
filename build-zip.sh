@@ -9,7 +9,7 @@ out=dist/screvi-koreader.zip
 stage=dist/stage/screvi.koplugin
 rm -rf dist
 mkdir -p "$stage"
-cp _meta.lua main.lua screvi_exporter.lua "$stage"/
+cp _meta.lua main.lua screvi_exporter.lua screvi_articles.lua screvi_epub.lua "$stage"/
 (cd dist/stage && COPYFILE_DISABLE=1 zip -qrX ../screvi-koreader.zip screvi.koplugin)
 rm -rf dist/stage
 unzip -l "$out"
