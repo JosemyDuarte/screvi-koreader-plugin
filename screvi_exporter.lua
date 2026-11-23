@@ -89,7 +89,9 @@ local function build(Base, plugin)
         -- Batch books so a large library stays well under the server's request limits.
         local batch, count = {}, 0
         for _, booknotes in ipairs(t) do
-            local source = createSource(booknotes)
+            -- The exporter has no shared hash bookkeeping. Article sync uses Tools → Screvi.
+            local article = plugin.isArticle and plugin.isArticle(booknotes.file)
+            local source = not article and createSource(booknotes)
             if source then
                 if count > 0 and count + #source.highlights > MAX_HIGHLIGHTS_PER_REQUEST then
                     if not self:sendSources(batch) then return false end

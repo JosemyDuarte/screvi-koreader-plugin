@@ -1,6 +1,6 @@
 local _ = require("gettext")
 return {
     fullname = _("Screvi"),
-    description = _([[Sync your KOReader highlights and notes to Screvi.]]),
-    version = "1.2.0",
+    description = _([[Read Screvi articles and sync your KOReader highlights and notes.]]),
+    version = "1.3.0",
 }

@@ -13,6 +13,7 @@ local md5 = require("ffi/sha2").md5
 local rapidjson = require("rapidjson")
 local T = require("ffi/util").template
 local _ = require("gettext")
+local Articles = require("screvi_articles")
 
 local Screvi = WidgetContainer:extend{
     name = "screvi",
@@ -21,7 +22,7 @@ local Screvi = WidgetContainer:extend{
 
 local API_URL = "https://api.screvi.com/api/extension/import"
 local PAIRING_URL = "https://api.screvi.com/api/device-pairing"
-local USER_AGENT = "screvi-koreader/1.2"
+local USER_AGENT = "screvi-koreader/1.3.0"
 local SETTINGS_FILE = "screvi_settings.lua"
 local IMPORT_TYPE = "koreader"
 -- The server skips sources without an author, so never send an empty one.
@@ -33,11 +34,32 @@ local MAX_HIGHLIGHTS_PER_REQUEST = 500
 -- Lifecycle
 -- ---------------------------------------------------------------------------
 
+-- ReaderUI and FileManager must never flush independent settings snapshots.
+local shared
+local function sharedState()
+    if not shared then
+        local settings = LuaSettings:open(DataStorage:getSettingsDir() .. "/" .. SETTINGS_FILE)
+        shared = {
+            settings = settings,
+            synced_hashes = settings:readSetting("synced_hashes", {}),
+            article_hashes = settings:readSetting("article_hashes", {}),
+            tracked = settings:readSetting("articles", {}),
+            gone = settings:readSetting("gone_articles", {}),
+        }
+    end
+    return shared
+end
+Screvi.sharedState = sharedState
+Screvi.USER_AGENT = USER_AGENT
+
 function Screvi:init()
-    self.settings = LuaSettings:open(DataStorage:getSettingsDir() .. "/" .. SETTINGS_FILE)
+    self.state = sharedState()
+    self.settings = self.state.settings
     self.api_key = self.settings:readSetting("api_key", "")
     self.auto_sync = self.settings:readSetting("auto_sync", false)
-    self.synced_hashes = self.settings:readSetting("synced_hashes", {})
+    self.synced_hashes = self.state.synced_hashes
+    self.articles = Articles.new(self)
+    self.download_with_sync = self.settings:readSetting("download_with_sync", true)
     -- Drop hashes from 0.1 (8-char djb2); they never match the md5 ones.
     for hash in pairs(self.synced_hashes) do
         if #hash ~= 32 then self.synced_hashes[hash] = nil end
@@ -49,6 +71,12 @@ function Screvi:init()
 end
 
 function Screvi:onDispatcherRegisterActions()
+    Dispatcher:registerAction("screvi_download", {
+        category = "none",
+        event = "ScreviDownload",
+        title = _("Screvi: download articles"),
+        general = true,
+    })
     Dispatcher:registerAction("screvi_sync", {
         category = "none",
         event = "ScreviSync",
@@ -73,6 +101,11 @@ function Screvi:onScreviSyncAll()
     return true
 end
 
+function Screvi:onScreviDownload()
+    self:downloadArticles()
+    return true
+end
+
 function Screvi:onCloseDocument()
     if not self.auto_sync or not self:hasApiKey() then return end
     -- Never prompt for Wi-Fi when leaving a book: if we're offline, the
@@ -83,12 +116,16 @@ function Screvi:onCloseDocument()
         logger.warn("Screvi: could not read highlights on close:", book)
         return
     end
-    if not book then return end
-    local sources = self:pendingSources({ book })
-    if #sources == 0 then return end
-    -- The document is being torn down; send once the close has finished.
+    -- Read the completion status now; the document is torn down by the next tick.
+    if book and book.article_id then
+        local read_ok, complete = pcall(self.articles.isFinished, self.articles, { file = book.file })
+        book.complete = read_ok and complete
+    end
     UIManager:nextTick(function()
-        local sent_ok, err = pcall(self.upload, self, sources, true)
+        local sent_ok, err = pcall(function()
+            if book then self:upload({ book }, true) end
+            self.articles:onClose(book)
+        end)
         if not sent_ok then logger.warn("Screvi: auto-sync failed:", err) end
     end)
 end
@@ -102,6 +139,30 @@ function Screvi:addToMainMenu(menu_items)
         text = _("Screvi"),
         sorting_hint = "tools",
         sub_item_table = {
+            {
+                text = _("Download articles"), keep_menu_open = true,
+                callback = function() self:downloadArticles() end,
+            },
+            {
+                text_func = function() return T(_("Download tag: %1"), self.articles.tag) end,
+                keep_menu_open = true,
+                callback = function(menu) self:showDownloadTagDialog(menu) end,
+            },
+            {
+                text_func = function() return T(_("Download folder: %1"), self.articles.folder) end,
+                keep_menu_open = true,
+                callback = function(menu) self:chooseDownloadFolder(menu) end,
+            },
+            {
+                text = _("Download articles with Sync all books"),
+                checked_func = function() return self.download_with_sync end,
+                callback = function()
+                    self.download_with_sync = not self.download_with_sync
+                    self.settings:saveSetting("download_with_sync", self.download_with_sync)
+                    self.settings:flush()
+                end,
+                separator = true,
+            },
             {
                 text = _("Sync current book"),
                 enabled_func = function() return self.ui.document ~= nil end,
@@ -145,14 +206,14 @@ function Screvi:addToMainMenu(menu_items)
             },
             {
                 text = _("Re-send all highlights"),
-                help_text = _("Forget which highlights were already sent. Screvi skips ones it already has, so this only fills gaps."),
+                help_text = _("Forget book highlight history. Article highlight history is kept."),
                 keep_menu_open = true,
                 callback = function()
                     UIManager:show(ConfirmBox:new{
-                        text = _("Forget sync history? The next sync will send every highlight again. Screvi skips the ones it already has."),
+                        text = _("Forget book sync history? The next sync will re-send book highlights. Article highlight history is kept."),
                         ok_text = _("Forget"),
                         ok_callback = function()
-                            self.synced_hashes = {}
+                            self:clearBookHashes()
                             self.settings:saveSetting("synced_hashes", self.synced_hashes)
                             self.settings:flush()
                         end,
@@ -183,6 +244,55 @@ end
 -- API key dialog
 -- ---------------------------------------------------------------------------
 
+--- Edit the tag used for article downloads.
+function Screvi:showDownloadTagDialog(menu)
+    local dialog
+    dialog = InputDialog:new{
+        title = _("Download tag"), input = self.articles.tag,
+        buttons = {{
+            {
+                text = _("Cancel"),
+                callback = function() UIManager:close(dialog) end,
+            },
+            {
+                text = _("Save"),
+                is_enter_default = true,
+                callback = function()
+                    local tag = (dialog:getInputText() or ""):gsub("^%s+", ""):gsub("%s+$", "")
+                    if tag == "" then return end
+                    self.articles.tag = tag
+                    self.settings:saveSetting("download_tag", tag)
+                    self.settings:flush()
+                    UIManager:close(dialog)
+                    if menu then menu:updateItems() end
+                end,
+            },
+        }},
+    }
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
+end
+
+--- Choose a directory through KOReader's PathChooser, as Wallabag does.
+function Screvi:chooseDownloadFolder(menu)
+    local PathChooser = require("ui/widget/pathchooser")
+    UIManager:show(PathChooser:new{
+        path = self.articles.folder, select_file = false, show_files = false,
+        onConfirm = function(path)
+            self.articles.folder = path
+            self.settings:saveSetting("download_folder", path)
+            self.settings:flush()
+            if menu then menu:updateItems() end
+        end,
+    })
+end
+
+--- Manual downloads may ask KOReader to connect to Wi-Fi.
+function Screvi:downloadArticles()
+    if not self:requireApiKey() then return end
+    NetworkMgr:runWhenOnline(function() self.articles:run() end)
+end
+
 function Screvi:hasApiKey()
     return self.api_key ~= nil and self.api_key ~= ""
 end
@@ -193,7 +303,7 @@ function Screvi:showApiKeyDialog(touchmenu_instance)
         title = _("Screvi API key"),
         input = self.api_key,
         input_hint = "sk_live_…",
-        description = _("Create one with write access at app.screvi.com → Settings → API."),
+        description = _("Create one with read and write access at app.screvi.com → Settings → API."),
         buttons = {
             {
                 {
@@ -229,32 +339,43 @@ end
 -- Pairing: connect with a short code instead of typing a key
 -- ---------------------------------------------------------------------------
 
---- POST a JSON body. Returns the HTTP status (nil when unreachable) and the decoded body.
-function Screvi:postJson(url, body)
+--- Treat JSON null as absent, including optional article metadata.
+local function withoutJsonNull(value)
+    if value == rapidjson.null then return nil end
+    if type(value) == "table" then
+        for key, item in pairs(value) do value[key] = withoutJsonNull(item) end
+    end
+    return value
+end
+
+--- Shared JSON transport. Always reset timeouts, even after a socket exception.
+function Screvi:requestJson(method, url, body, authenticated)
     local http = require("socket.http")
     local ltn12 = require("ltn12")
-    local socket = require("socket")
     local socketutil = require("socketutil")
-
-    local payload = rapidjson.encode(body)
+    local payload = body and rapidjson.encode(body)
     local sink = {}
-    socketutil:set_timeout(10, 15)
-    local code = socket.skip(1, http.request{
-        url = url,
-        method = "POST",
-        headers = {
-            ["Content-Type"] = "application/json",
-            ["Content-Length"] = tostring(#payload),
-            ["User-Agent"] = USER_AGENT,
-        },
-        source = ltn12.source.string(payload),
-        sink = ltn12.sink.table(sink),
+    local headers = { ["User-Agent"] = USER_AGENT, ["Accept"] = "application/json" }
+    if authenticated then headers["X-API-Key"] = self.api_key end
+    if payload then
+        headers["Content-Type"] = "application/json"
+        headers["Content-Length"] = tostring(#payload)
+    end
+    socketutil:set_timeout(10, 30)
+    local ok, _, code = pcall(http.request, {
+        url = url, method = method, headers = headers,
+        source = payload and ltn12.source.string(payload), sink = ltn12.sink.table(sink),
     })
     socketutil:reset_timeout()
+    if not ok then logger.warn("Screvi: request failed", url) end
+    local decoded_ok, decoded = pcall(rapidjson.decode, table.concat(sink))
+    return ok and type(code) == "number" and code or nil,
+        decoded_ok and type(decoded) == "table" and withoutJsonNull(decoded) or {}
+end
 
-    local text = table.concat(sink)
-    local ok, decoded = pcall(rapidjson.decode, text)
-    return type(code) == "number" and code or nil, ok and type(decoded) == "table" and decoded or {}
+--- Pairing uses the same transport without sending an existing device key.
+function Screvi:postJson(url, body)
+    return self:requestJson("POST", url, body, false)
 end
 
 --- What the approval page shows as this device, e.g. "Kindle Paperwhite".
@@ -486,6 +607,7 @@ function Screvi.bookFromProps(props, file)
         author = nil
     end
     return {
+        file = file,
         name = title or _("Unknown"),
         author = author or UNKNOWN_AUTHOR,
         type = "book",
@@ -556,6 +678,7 @@ function Screvi:getCurrentBook()
     if self.ui.annotation and self.ui.annotation.annotations then
         book.highlights = Screvi.parseAnnotations(self.ui.annotation.annotations)
     end
+    book.article_id = self.articles:identify(file)
     return book
 end
 
@@ -571,6 +694,7 @@ function Screvi.getBookFromSidecar(file)
             doc_settings:readSetting("highlight"),
             doc_settings:readSetting("bookmarks"))
     end
+    book.article_id = Articles.identify(sharedState(), file)
     return book
 end
 
@@ -600,7 +724,7 @@ end
 -- ---------------------------------------------------------------------------
 
 function Screvi.highlightHash(book, highlight)
-    return md5(book.name .. "\0" .. highlight.content .. "\0" .. (highlight.note or ""))
+    return md5((book.article_id and ("screvi-article:" .. book.article_id) or book.name) .. "\0" .. highlight.content .. "\0" .. (highlight.note or ""))
 end
 
 --- Copies of the books holding only highlights not yet sent.
@@ -608,8 +732,10 @@ function Screvi:pendingSources(books)
     local sources = {}
     for _, book in ipairs(books) do
         local pending = {}
+        -- Articles deleted on Screvi keep their highlights on the device only.
+        local gone = book.article_id and self.state.gone[tostring(book.article_id)]
         for _, h in ipairs(book.highlights) do
-            if not self.synced_hashes[Screvi.highlightHash(book, h)] then
+            if not gone and not self.synced_hashes[Screvi.highlightHash(book, h)] then
                 table.insert(pending, h)
             end
         end
@@ -623,15 +749,33 @@ function Screvi:pendingSources(books)
     return sources
 end
 
-function Screvi:markSynced(sources)
+function Screvi:markSynced(sources, operation)
     for _, source in ipairs(sources) do
         for _, h in ipairs(source.highlights) do
-            self.synced_hashes[Screvi.highlightHash(source, h)] = true
+            local hash = Screvi.highlightHash(source, h)
+            self.synced_hashes[hash] = true
+            if source.article_id then self.state.article_hashes[hash] = true end
         end
     end
+    if operation then operation.sync_dirty = true; return end
+    self:flushSynced()
+end
+
+--- Flush accepted highlight bookkeeping once at the operation boundary.
+function Screvi:flushSynced(operation)
+    if operation and not operation.sync_dirty then return end
+    if operation then operation.sync_dirty = nil end
     self.settings:saveSetting("synced_hashes", self.synced_hashes)
+    self.settings:saveSetting("article_hashes", self.state.article_hashes)
     self.settings:saveSetting("last_sync", os.date("%Y-%m-%d %H:%M"))
     self.settings:flush()
+end
+
+--- Re-send books without forgetting the article bulk endpoint's history.
+function Screvi:clearBookHashes()
+    for hash in pairs(self.synced_hashes) do
+        if not self.state.article_hashes[hash] then self.synced_hashes[hash] = nil end
+    end
 end
 
 --- Split sources into requests of at most MAX_HIGHLIGHTS_PER_REQUEST highlights.
@@ -700,9 +844,8 @@ function Screvi:syncAllBooks()
     UIManager:forceRePaint()
     local books = self:getAllBooks()
     UIManager:close(scanning)
-
     local sources = self:pendingSources(books)
-    if #sources == 0 then
+    local function showNothingToSync()
         local any = false
         for _, b in ipairs(books) do
             if #b.highlights > 0 then any = true break end
@@ -711,78 +854,99 @@ function Screvi:syncAllBooks()
             text = any and _("All highlights are already synced.") or _("No highlights found."),
             timeout = 2,
         })
+    end
+    if #sources == 0 and not self.download_with_sync then
+        showNothingToSync()
         return
     end
-    NetworkMgr:runWhenOnline(function() self:upload(sources, false) end)
+    NetworkMgr:runWhenOnline(function()
+        if #sources > 0 then
+            local _, operation = self:upload(sources, false)
+            if operation.rate_limited then return end
+        else
+            showNothingToSync()
+        end
+        if self.download_with_sync then self.articles:run() end
+    end)
 end
 
 -- ---------------------------------------------------------------------------
 -- HTTP
 -- ---------------------------------------------------------------------------
 
---- POST one batch. Returns the decoded body on success, or nil and an error message.
-function Screvi:post(sources)
-    local http = require("socket.http")
-    local ltn12 = require("ltn12")
-    local socket = require("socket")
-    local socketutil = require("socketutil")
-
-    local payload = rapidjson.encode({ type = IMPORT_TYPE, data = sources })
-    local sink = {}
-    socketutil:set_timeout(socketutil.LARGE_BLOCK_TIMEOUT, socketutil.LARGE_TOTAL_TIMEOUT)
-    local code, _headers, status = socket.skip(1, http.request{
-        url = API_URL,
-        method = "POST",
-        headers = {
-            ["Content-Type"] = "application/json",
-            ["Content-Length"] = tostring(#payload),
-            ["X-API-Key"] = self.api_key,
-            ["User-Agent"] = USER_AGENT,
-        },
-        source = ltn12.source.string(payload),
-        sink = ltn12.sink.table(sink),
-    })
-    socketutil:reset_timeout()
-
-    local body = table.concat(sink)
-    local decoded = body ~= "" and rapidjson.decode(body) or nil
-    if code == 200 then
-        return decoded or {}
-    end
-
-    logger.warn("Screvi: import failed", code, status, body)
-    local server_msg = type(decoded) == "table" and decoded.error or nil
-    if type(code) ~= "number" then
-        return nil, _("Couldn't reach Screvi. Check your connection and try again.")
+--- Translate import and article API failures into messages.
+function Screvi:httpError(code, result)
+    local server_msg = type(result.message) == "string" and result.message
+        or type(result.error) == "string" and result.error or nil
+    if not code then
+        return _("Couldn't reach Screvi. Check your connection and try again.")
     elseif code == 401 then
-        return nil, _("Screvi rejected the API key. Check it in Screvi → API key.")
+        return _("Screvi rejected the API key. Check it in Screvi → API key.")
+    elseif code == 402 or code == 403 and result.code == "subscription_required" then
+        return server_msg or _("A Screvi subscription is required.")
     elseif code == 403 then
-        return nil, server_msg or _("This API key isn't allowed to import highlights.")
+        return server_msg or _("This API key isn't allowed to import highlights.")
     elseif code == 413 then
-        return nil, _("Too many highlights in one go. Try syncing a single book.")
+        return _("Too many highlights in one go. Try syncing a single book.")
     elseif code == 429 then
-        return nil, _("Too many requests. Wait a minute and try again.")
+        return _("Too many requests. Wait a minute and try again.")
     end
-    return nil, T(_("Sync failed (HTTP %1)."), code) .. (server_msg and ("\n" .. server_msg) or "")
+    return T(_("Sync failed (HTTP %1)."), code) .. (server_msg and ("\n" .. server_msg) or "")
+end
+
+--- The import endpoint is reserved for books; article highlights have their own source.
+function Screvi:post(sources, operation)
+    local data = {}
+    -- Not `_`: that would shadow gettext inside the loop.
+    for _i, source in ipairs(sources) do
+        if source.article_id then return nil, _("Article highlights must use article sync.") end
+        -- Drop local-only fields.
+        local item = {}
+        for key, value in pairs(source) do
+            if key ~= "file" and key ~= "complete" then item[key] = value end
+        end
+        data[#data + 1] = item
+    end
+    local code, result = self:requestJson("POST", API_URL, { type = IMPORT_TYPE, data = data }, true)
+    if code == 429 and operation then operation.rate_limited = true end
+    if code == 200 then return result end
+    logger.warn("Screvi: import failed", code, result.error)
+    return nil, self:httpError(code, result)
 end
 
 function Screvi:upload(sources, silent)
-    local batches = Screvi.batchSources(sources)
-    local sent, added, failed = 0, 0, nil
+    local operation = {}
+    sources = self:pendingSources(sources)
+    local books, sent, added, failed = {}, 0, 0, nil
+    local function failure(err)
+        if err then failed = failed and (failed .. "\n" .. err) or err end
+    end
+    for _, source in ipairs(sources) do
+        if operation.rate_limited then break end
+        if source.article_id then
+            local ok, err, _, new = self.articles:upload(source, operation)
+            added = added + (new or 0)
+            if ok then sent = sent + #source.highlights
+            else failure(err) end
+        else books[#books + 1] = source end
+    end
+    local batches = Screvi.batchSources(books)
     for _, batch in ipairs(batches) do
-        local result, err = self:post(batch)
+        if operation.rate_limited then break end
+        local result, err = self:post(batch, operation)
         if not result then
-            failed = err
+            failure(err)
             break
         end
-        self:markSynced(batch)
+        self:markSynced(batch, operation)
         for _, s in ipairs(batch) do sent = sent + #s.highlights end
         local stats = type(result.results) == "table" and result.results or {}
         added = added + (tonumber(stats.newHighlights) or 0)
     end
 
+    self:flushSynced(operation)
     logger.info("Screvi: sent", sent, "highlights,", added, "new")
-    if silent then return end
+    if silent or #sources == 0 then return not failed, operation end
 
     local msg
     if sent == 0 then
@@ -801,6 +965,7 @@ function Screvi:upload(sources, silent)
         end
     end
     UIManager:show(InfoMessage:new{ text = msg, timeout = failed and nil or 3 })
+    return not failed, operation
 end
 
 -- ---------------------------------------------------------------------------
@@ -809,7 +974,7 @@ end
 
 --- The key saved by Connect to Screvi, read fresh so every UI sees the latest one.
 function Screvi.getApiKey()
-    local key = LuaSettings:open(DataStorage:getSettingsDir() .. "/" .. SETTINGS_FILE):readSetting("api_key")
+    local key = sharedState().settings:readSetting("api_key")
     return type(key) == "string" and key ~= "" and key or nil
 end
 
@@ -831,6 +996,9 @@ function Screvi.registerExporter()
         return require("screvi_exporter").build(Base, {
             API_URL = API_URL,
             getApiKey = Screvi.getApiKey,
+            isArticle = function(file)
+                return Articles.identify(sharedState(), file) ~= nil
+            end,
             connect = function()
                 if Screvi.instance then Screvi.instance:connect() end
             end,
