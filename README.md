@@ -49,6 +49,10 @@ The plugin also adds **Screvi** to KOReader's built-in **Export highlights** men
 
 Tag articles **koreader** in Screvi. In KOReader, choose **Tools → Screvi → Download articles**. Articles that are still being parsed wait for the next download.
 
+| Download | Your articles | Read | Finish |
+|---|---|---|---|
+| <img src="docs/screenshots/articles-menu.png" width="190" alt="The Screvi menu with Download articles, Download tag and Download folder"> | <img src="docs/screenshots/articles-folder.png" width="190" alt="Downloaded articles in the Screvi folder, with cover images"> | <img src="docs/screenshots/articles-reading.png" width="190" alt="An article open in KOReader, with its title, author, site, date, link and image"> | <img src="docs/screenshots/articles-finished.png" width="190" alt="KOReader's book status set to Finished"> |
+
 Articles are saved as EPUBs in **Screvi** inside your KOReader home folder. Images are included when they can be downloaded. Change **Download tag** or **Download folder** in the Screvi menu. Existing files are skipped.
 
 **Sync all books** also downloads articles by default. Turn off **Download articles with Sync all books** to download only when you choose to.
