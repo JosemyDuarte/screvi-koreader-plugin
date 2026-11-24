@@ -40,14 +40,9 @@ function Articles.new(plugin)
         end,
     })
     self.tag = state.tag or plugin.settings:readSetting("download_tag", "koreader")
-    -- Older records predate per-download tags; migrate before changing the setting.
     -- Only flush when something changed: this runs on every ReaderUI and FileManager start.
     local changed = false
     for _, item in pairs(self.tracked) do
-        if not item.tag then
-            item.tag = self.tag
-            changed = true
-        end
         if item.pending_file then
             if not lfs.attributes(item.file) and lfs.attributes(item.pending_file, "mode") == "file" then
                 os.rename(item.pending_file, item.file)
@@ -77,17 +72,20 @@ function Articles:save()
 end
 
 --- Match tracked paths, with a full stable filename ID as a routing fallback.
-function Articles:identify(file)
+function Articles.identify(tracked, file)
     if type(file) ~= "string" then return nil end
-    for id, item in pairs(self.tracked) do if item.file == file then return tostring(id) end end
+    for id, item in pairs(tracked) do if item.file == file then return tostring(id) end end
     return file:match("%[screvi%-([%w%-]+)%]%.epub$")
 end
 
 --- Share the authenticated JSON transport, and translate public API errors.
-function Articles:request(method, path, body, operation)
-    local code, result = self.plugin:requestJson(method, Articles.API_URL .. path, body, true)
-    if code == 429 and operation then operation.rate_limited = true end
-    if code == 404 or result.code == "not_found" or result.error == "not_found" then return gone() end
+--- When `gone_id` is given, a 404 forgets that article.
+function Articles:request(method, path, body, operation, gone_id)
+    local code, result = self.plugin:requestJson(method, Articles.API_URL .. path, body, true, operation)
+    if code == 404 or result.code == "not_found" or result.error == "not_found" then
+        if gone_id then self:forgetGone(gone_id) end
+        return gone()
+    end
     if code and code >= 200 and code < 300 then return result end
     logger.warn("Screvi: article API failed", method, path, code, result.message or result.error)
     if code == 403 and result.code ~= "subscription_required" then
@@ -101,11 +99,8 @@ end
 
 --- Fetch an article's highlights, forgetting it when Screvi no longer has it.
 function Articles:fetchRemote(id, operation)
-    local remote, err, state = self:request("GET", "/articles/" .. id .. "?format=text&max_chars=1000", nil, operation)
-    if not remote then
-        if state == "gone" then self:forgetGone(id) end
-        return nil, err, state
-    end
+    local remote, err, state = self:request("GET", "/articles/" .. id .. "?format=text&max_chars=1000", nil, operation, id)
+    if not remote then return nil, err, state end
     if isDeleted(remote.data) then
         self:forgetGone(id)
         return gone()
@@ -255,7 +250,7 @@ function Articles:upload(source, operation)
             matched[#matched + 1] = h
         else
             if not originals[key] then
-                pending[#pending + 1] = h
+                pending[#pending + 1] = key
                 originals[key] = {}
             end
             originals[key][#originals[key] + 1] = h
@@ -265,18 +260,16 @@ function Articles:upload(source, operation)
     for first = 1, #pending, 100 do
         local highlights, original = {}, {}
         for i = first, math.min(first + 99, #pending) do
-            local h = pending[i]
+            local key = pending[i]
+            local h = originals[key][1]
             highlights[#highlights + 1] = {
                 article_id = source.article_id, content = h.content, note = noteForApi(h.note),
                 location = locationForApi(h.location), date = h.date, metadata = h.metadata,
             }
-            for _, h2 in ipairs(originals[highlightKey(h)]) do original[#original + 1] = h2 end
+            for _, h2 in ipairs(originals[key]) do original[#original + 1] = h2 end
         end
-        local result, why, status = self:request("POST", "/highlights/bulk", { highlights = highlights }, operation)
-        if not result then
-            if status == "gone" then self:forgetGone(id) end
-            return done(nil, why, status)
-        end
+        local result, why, status = self:request("POST", "/highlights/bulk", { highlights = highlights }, operation, id)
+        if not result then return done(nil, why, status) end
         added = added + #highlights
         mark(original)
     end
@@ -288,9 +281,7 @@ function Articles:book(id, item, snapshot)
     if snapshot and snapshot.file == item.file then return snapshot end
     local p = self.plugin
     if p.ui.document and p.ui.document.file == item.file then return p:getCurrentBook() end
-    local book = p.getBookFromSidecar(item.file)
-    book.article_id = tostring(id)
-    return book
+    return p.getBookFromSidecar(item.file)
 end
 
 --- Sync before archiving or removing anything; a sidecar read failure preserves the file.
@@ -360,11 +351,8 @@ function Articles:finish(id, snapshot, operation)
     local ok, err, state = self:syncBeforeRemoval(id, item, snapshot, operation)
     if not ok then return nil, err, state end
     local result
-    result, err, state = self:request("PATCH", "/articles/" .. id, { home_status = "archive" }, operation)
-    if not result then
-        if state == "gone" then self:forgetGone(id) end
-        return nil, err, state
-    end
+    result, err, state = self:request("PATCH", "/articles/" .. id, { home_status = "archive" }, operation, id)
+    if not result then return nil, err, state end
     local removed, remove_error = self:remove(id, snapshot)
     if not removed and remove_error then return nil, remove_error end
     return true
@@ -410,15 +398,24 @@ function Articles:runBody(counts)
             logger.warn("Screvi: article failed", ok and why or result)
         end
     end
-    local progress, index, total = nil, 0, 0
+    local progress
+    local function showProgress(text)
+        if progress then UIManager:close(progress) end
+        progress = InfoMessage:new{ text = text }
+        UIManager:show(progress)
+        UIManager:forceRePaint()
+    end
+    local function notReady(id)
+        counts.not_ready = counts.not_ready + 1
+        logger.dbg("Screvi: article not ready", id)
+        return true
+    end
+    local index, total = 0, 0
     for _ in pairs(self.tracked) do total = total + 1 end
     for id, item in pairs(self.tracked) do
         if counts.rate_limited then break end
         index = index + 1
-        if progress then UIManager:close(progress) end
-        progress = InfoMessage:new{ text = T(_("Syncing article %1 of %2…"), index, total) }
-        UIManager:show(progress)
-        UIManager:forceRePaint()
+        showProgress(T(_("Syncing article %1 of %2…"), index, total))
         attempt(function()
             local remote = by_id[tostring(id)]
             if isDeleted(remote) then
@@ -448,18 +445,11 @@ function Articles:runBody(counts)
     end
     for i, article in ipairs(list) do
         if counts.rate_limited then break end
-        if progress then UIManager:close(progress) end
-        progress = InfoMessage:new{ text = T(_("Downloading %1 of %2…"), i, #list) }
-        UIManager:show(progress)
-        UIManager:forceRePaint()
+        showProgress(T(_("Downloading %1 of %2…"), i, #list))
         attempt(function()
             local id = tostring(article.id)
             if self.plugin.state.gone[id] or unavailable(article) or finished[id] then return true end
-            if article.parse_state ~= "parsed" then
-                counts.not_ready = counts.not_ready + 1
-                logger.dbg("Screvi: article not ready", id)
-                return true
-            end
+            if article.parse_state ~= "parsed" then return notReady(id) end
             local old_item
             if self.tracked[id] then
                 if lfs.attributes(self.tracked[id].file, "mode") == "file" then return true end
@@ -471,11 +461,7 @@ function Articles:runBody(counts)
             local file = self:filename(article)
             if lfs.attributes(file) then return true end
             local full, why, state = self:content(id, counts)
-            if state == "not_ready" then
-                counts.not_ready = counts.not_ready + 1
-                logger.dbg("Screvi: article not ready", id)
-                return true
-            end
+            if state == "not_ready" then return notReady(id) end
             if not full then return nil, why, state end
             if unavailable(full) then return true end
             full.id = id

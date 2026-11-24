@@ -30,6 +30,14 @@ local UNKNOWN_AUTHOR = "Unknown Author"
 -- Keep each request well under the server's body limit and timeout.
 local MAX_HIGHLIGHTS_PER_REQUEST = 500
 
+--- Trimmed string, or nil when blank or not a string.
+local function trim(s)
+    if type(s) ~= "string" then return nil end
+    s = s:gsub("^%s+", ""):gsub("%s+$", "")
+    if s == "" then return nil end
+    return s
+end
+
 -- ---------------------------------------------------------------------------
 -- Lifecycle
 -- ---------------------------------------------------------------------------
@@ -258,8 +266,8 @@ function Screvi:showDownloadTagDialog(menu)
                 text = _("Save"),
                 is_enter_default = true,
                 callback = function()
-                    local tag = (dialog:getInputText() or ""):gsub("^%s+", ""):gsub("%s+$", "")
-                    if tag == "" then return end
+                    local tag = trim(dialog:getInputText())
+                    if not tag then return end
                     self.articles.tag = tag
                     self.settings:saveSetting("download_tag", tag)
                     self.settings:flush()
@@ -349,7 +357,8 @@ local function withoutJsonNull(value)
 end
 
 --- Shared JSON transport. Always reset timeouts, even after a socket exception.
-function Screvi:requestJson(method, url, body, authenticated)
+--- A 429 marks `operation` rate-limited so batch loops stop.
+function Screvi:requestJson(method, url, body, authenticated, operation, block_timeout, total_timeout)
     local http = require("socket.http")
     local ltn12 = require("ltn12")
     local socketutil = require("socketutil")
@@ -361,13 +370,14 @@ function Screvi:requestJson(method, url, body, authenticated)
         headers["Content-Type"] = "application/json"
         headers["Content-Length"] = tostring(#payload)
     end
-    socketutil:set_timeout(10, 30)
+    socketutil:set_timeout(block_timeout or 10, total_timeout or 30)
     local ok, _, code = pcall(http.request, {
         url = url, method = method, headers = headers,
         source = payload and ltn12.source.string(payload), sink = ltn12.sink.table(sink),
     })
     socketutil:reset_timeout()
     if not ok then logger.warn("Screvi: request failed", url) end
+    if code == 429 and operation then operation.rate_limited = true end
     local decoded_ok, decoded = pcall(rapidjson.decode, table.concat(sink))
     return ok and type(code) == "number" and code or nil,
         decoded_ok and type(decoded) == "table" and withoutJsonNull(decoded) or {}
@@ -557,13 +567,6 @@ local function isEmpty(s)
     return s == nil or s == ""
 end
 
-local function trim(s)
-    if type(s) ~= "string" then return nil end
-    s = s:gsub("^%s+", ""):gsub("%s+$", "")
-    if s == "" then return nil end
-    return s
-end
-
 --- KOReader stores local "YYYY-MM-DD HH:MM:SS"; Screvi wants UTC ISO 8601.
 function Screvi.toIsoDate(datetime)
     if type(datetime) ~= "string" then return nil end
@@ -572,7 +575,8 @@ function Screvi.toIsoDate(datetime)
     local ts = os.time{
         year = tonumber(y), month = tonumber(mo), day = tonumber(d),
         hour = tonumber(h), min = tonumber(mi), sec = tonumber(s),
-        isdst = -1,
+        -- Leave isdst absent so mktime infers DST for this local date.
+        -- Lua 5.1/LuaJIT treats numeric -1 as true, forcing summer time.
     }
     if not ts then return nil end
     return os.date("!%Y-%m-%dT%H:%M:%SZ", ts)
@@ -678,7 +682,7 @@ function Screvi:getCurrentBook()
     if self.ui.annotation and self.ui.annotation.annotations then
         book.highlights = Screvi.parseAnnotations(self.ui.annotation.annotations)
     end
-    book.article_id = self.articles:identify(file)
+    book.article_id = Articles.identify(self.state.tracked, file)
     return book
 end
 
@@ -694,7 +698,7 @@ function Screvi.getBookFromSidecar(file)
             doc_settings:readSetting("highlight"),
             doc_settings:readSetting("bookmarks"))
     end
-    book.article_id = Articles.identify(sharedState(), file)
+    book.article_id = Articles.identify(sharedState().tracked, file)
     return book
 end
 
@@ -907,8 +911,9 @@ function Screvi:post(sources, operation)
         end
         data[#data + 1] = item
     end
-    local code, result = self:requestJson("POST", API_URL, { type = IMPORT_TYPE, data = data }, true)
-    if code == 429 and operation then operation.rate_limited = true end
+    local socketutil = require("socketutil")
+    local code, result = self:requestJson("POST", API_URL, { type = IMPORT_TYPE, data = data }, true, operation,
+        socketutil.LARGE_BLOCK_TIMEOUT, socketutil.LARGE_TOTAL_TIMEOUT)
     if code == 200 then return result end
     logger.warn("Screvi: import failed", code, result.error)
     return nil, self:httpError(code, result)
@@ -997,7 +1002,7 @@ function Screvi.registerExporter()
             API_URL = API_URL,
             getApiKey = Screvi.getApiKey,
             isArticle = function(file)
-                return Articles.identify(sharedState(), file) ~= nil
+                return Articles.identify(sharedState().tracked, file) ~= nil
             end,
             connect = function()
                 if Screvi.instance then Screvi.instance:connect() end

@@ -100,8 +100,12 @@ function Epub.downloadImage(url, user_agent)
 end
 
 local allowed = {}
-for tag in ("p div span article section header footer h1 h2 h3 h4 h5 h6 blockquote pre code em strong b i u s del a ul ol li dl dt dd figure figcaption table thead tbody tfoot tr th td sup sub br hr img"):gmatch("%S+") do allowed[tag] = true end
-local void = { br = true, hr = true, img = true }
+-- A safe subset of XHTML 1.1; legacy presentational tags such as u/s/font
+-- are not part of that vocabulary. Unsupported wrappers retain their text.
+for tag in ("p div span h1 h2 h3 h4 h5 h6 blockquote pre code em strong b i del ins a ul ol li dl dt dd table caption col colgroup thead tbody tfoot tr th td sup sub br hr img abbr acronym address big cite dfn kbd q samp small tt var"):gmatch("%S+") do allowed[tag] = true end
+local mapped = { figcaption = "div", mark = "span", time = "span" }
+for tag in ("figure article section header footer aside nav main hgroup details summary"):gmatch("%S+") do mapped[tag] = "div" end
+local void = { br = true, hr = true, img = true, col = true }
 local IMAGE_EXTENSIONS = {
     ["image/jpeg"] = "jpg",
     ["image/png"] = "png",
@@ -139,7 +143,7 @@ function Epub.xhtml(html, article, fetch, add_image)
     local cover = article.image_url and image(article.image_url)
     if cover then output[#output + 1] = '<p><img src="' .. cover.path .. '" alt=""/></p>' end
     local function closeTo(index)
-        for i = #stack, index, -1 do output[#output + 1] = "</" .. table.remove(stack) .. ">" end
+        for i = #stack, index, -1 do output[#output + 1] = "</" .. table.remove(stack).tag .. ">" end
     end
     html = html:gsub("<!%-%-.-%-%->", "")
     local pos, blocked = 1, nil
@@ -166,29 +170,33 @@ function Epub.xhtml(html, article, fetch, add_image)
         output[#output + 1] = Epub.escape(entities(html:sub(pos, first - 1)))
         -- A '>' only ends the token outside a quoted attribute.
         local last, quote = first + 1, nil
-        while last <= #html do
-            local ch = html:sub(last, last)
-            if quote then if ch == quote then quote = nil end
-            elseif ch == '"' or ch == "'" then quote = ch
-            elseif ch == ">" then break end
-            last = last + 1
+        while last do
+            if quote then
+                last = html:find(quote, last, true)
+                if last then quote, last = nil, last + 1 end
+            else
+                last = html:find("[\"'>]", last)
+                if not last or html:byte(last) == 62 then break end -- 62 is '>'
+                quote, last = html:sub(last, last), last + 1
+            end
         end
-        if last > #html then
+        if not last then
             output[#output + 1] = Epub.escape(entities(html:sub(first)))
             break
         end
         local token = html:sub(first, last)
-        local closing, tag = token:match("^<%s*(/?)%s*([%w]+)")
-        tag = tag and tag:lower()
-        if tag == "script" or tag == "style" or tag == "iframe" or tag == "noscript" then
-            if closing ~= "/" and not token:match("/%s*>$") then blocked = tag end
+        local closing, source_tag = token:match("^<%s*(/?)%s*([%a][%w:._%-]*)")
+        source_tag = source_tag and source_tag:lower()
+        local tag = mapped[source_tag] or source_tag
+        if source_tag == "script" or source_tag == "style" or source_tag == "iframe" or source_tag == "noscript" then
+            if closing ~= "/" and not token:match("/%s*>$") then blocked = source_tag end
         elseif allowed[tag] then
             if closing == "/" then
-                for i = #stack, 1, -1 do if stack[i] == tag then closeTo(i); break end end
+                for i = #stack, 1, -1 do if stack[i].source == source_tag then closeTo(i); break end end
             else
-                if (tag == "p" or tag == "li") and stack[#stack] == tag then closeTo(#stack) end
+                if (tag == "p" or tag == "li") and stack[#stack] and stack[#stack].tag == tag then closeTo(#stack) end
                 local attrs = {}
-                local rest = token:match("^<%s*[%w]+(.-)>$") or ""
+                local rest = token:match("^<%s*[%a][%w:._%-]*(.-)>$") or ""
                 while #rest > 0 do
                     rest = rest:gsub("^%s+", "")
                     local key, tail = rest:match("^([%w_:%-]+)(.*)$")
@@ -210,6 +218,8 @@ function Epub.xhtml(html, article, fetch, add_image)
                     end
                 end
                 local suffix = ""
+                -- Emit only attributes legal on this specific XHTML element.
+                if source_tag == "figcaption" then suffix = ' class="caption"' end
                 if tag == "img" then
                     local src = attrs.src
                     if not src or src == "" or src:lower():match("^data:") then
@@ -220,10 +230,19 @@ function Epub.xhtml(html, article, fetch, add_image)
                 elseif tag == "a" and attrs.href then
                     local ok, href = pcall(Epub.resolveUrl, article.url, attrs.href)
                     if ok and href then suffix = ' href="' .. Epub.escape(href) .. '"' end
+                elseif tag == "td" or tag == "th" then
+                    for _, key in ipairs({ "colspan", "rowspan" }) do
+                        local value = attrs[key] and entities(attrs[key])
+                        local n = value and value:match("^%d+$") and tonumber(value)
+                        if n and n > 0 then suffix = suffix .. ' ' .. key .. '="' .. math.min(n, 1000) .. '"' end
+                    end
                 end
                 if tag then
                     output[#output + 1] = "<" .. tag .. suffix .. (void[tag] and "/>" or ">")
-                    if not void[tag] then stack[#stack + 1] = tag end
+                    if not void[tag] then
+                        stack[#stack + 1] = { source = source_tag, tag = tag }
+                        if token:match("/%s*>$") then closeTo(#stack) end
+                    end
                 end
             end
         end
@@ -233,28 +252,62 @@ function Epub.xhtml(html, article, fetch, add_image)
     return table.concat(output), images, cover
 end
 
+local function nonempty(value)
+    if type(value) ~= "string" then return nil end
+    value = value:gsub("^%s+", ""):gsub("%s+$", "")
+    return value ~= "" and value or nil
+end
+
+local MONTHS = { "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" }
+local function humanDate(value)
+    local y, m, d = (nonempty(value) or ""):match("^(%d%d%d%d)%-(%d%d)%-(%d%d)")
+    m, d = tonumber(m), tonumber(d)
+    if not m or not MONTHS[m] or d < 1 or d > 31 then return nil end
+    return d .. " " .. MONTHS[m] .. " " .. y
+end
+
+local function articleHeader(article, title)
+    local lines, byline = {}, {}
+    local author = nonempty(article.author)
+    local site = nonempty(article.site_name) or nonempty(article.source_domain)
+    if author then byline[#byline + 1] = author end
+    if site then byline[#byline + 1] = site end
+    if #byline > 0 then lines[#lines + 1] = "<p>" .. Epub.escape(table.concat(byline, " · ")) .. "</p>" end
+    local date = humanDate(article.published_date) or humanDate(article.saved_at)
+    if date then lines[#lines + 1] = "<p>" .. date .. "</p>" end
+    local url = nonempty(article.url)
+    if url then
+        url = Epub.escape(url)
+        lines[#lines + 1] = '<p><a href="' .. url .. '">' .. url .. '</a></p>'
+    end
+    return "<h1>" .. Epub.escape(title) .. '</h1><div class="header">' .. table.concat(lines) .. "</div>"
+end
+
 --- Write an EPUB to a temporary file, then rename only after successful packaging.
 function Epub.build(article, path, fetch, user_agent, before_rename)
     local writer, tmp = nil, path .. ".tmp"
     local ok, err = pcall(function()
         local esc = Epub.escape
         local title = article.title or _("Untitled article")
-        local header = "<h1>" .. esc(title) .. "</h1><div class=\"header\"><p>" .. esc(article.author) .. "<br/>" .. esc(article.site_name or article.source_domain) .. "</p><p><a href=\"" .. esc(article.url) .. "\">" .. esc(article.url) .. "</a><br/>" .. esc(article.saved_at) .. "</p></div>"
+        local header = articleHeader(article, title)
         writer = require("ffi/archiver").Writer:new{}
         assert(writer:open(tmp, "epub"), "Cannot open EPUB")
         local function add(name, data) assert(writer:addFileFromMemory(name, data, os.time()), "Cannot write " .. name) end
         writer:setZipCompression("store")
+        -- ffi/archiver always sets mtime and exposes no option to suppress ZIP
+        -- timestamp extra fields; keep mimetype first and uncompressed.
         add("mimetype", "application/epub+zip")
         writer:setZipCompression("deflate")
         add("META-INF/container.xml", '<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>')
         local body, images, cover = Epub.xhtml(article.content, article,
             fetch or function(url) return Epub.downloadImage(url, user_agent) end,
             function(name, data) add("OEBPS/" .. name, data) end)
-        local manifest = '<item id="content" href="content.xhtml" media-type="application/xhtml+xml"/><item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>'
-        for _, img in ipairs(images) do manifest = manifest .. '<item id="' .. img.id .. '" href="' .. img.path .. '" media-type="' .. img.mime .. '"/>' end
+        local items = { '<item id="content" href="content.xhtml" media-type="application/xhtml+xml"/><item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>' }
+        for _, img in ipairs(images) do items[#items + 1] = '<item id="' .. img.id .. '" href="' .. img.path .. '" media-type="' .. img.mime .. '"/>' end
+        local manifest = table.concat(items)
         add("OEBPS/content.opf", '<?xml version="1.0" encoding="utf-8"?><package xmlns="http://www.idpf.org/2007/opf" xmlns:dc="http://purl.org/dc/elements/1.1/" version="2.0" unique-identifier="bookid"><metadata><dc:title>' .. esc(title) .. '</dc:title><dc:creator>' .. esc(article.author) .. '</dc:creator><dc:source>' .. esc(article.url) .. '</dc:source><dc:identifier id="bookid">' .. esc(article.id) .. '</dc:identifier><dc:language>' .. esc(article.language or "en") .. '</dc:language>' .. (cover and '<meta name="cover" content="' .. cover.id .. '"/>' or "") .. '</metadata><manifest>' .. manifest .. '</manifest><spine toc="ncx"><itemref idref="content"/></spine></package>')
         add("OEBPS/toc.ncx", '<?xml version="1.0"?><ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1"><head><meta name="dtb:uid" content="' .. esc(article.id) .. '"/></head><docTitle><text>' .. esc(title) .. '</text></docTitle><navMap><navPoint id="article" playOrder="1"><navLabel><text>' .. esc(title) .. '</text></navLabel><content src="content.xhtml"/></navPoint></navMap></ncx>')
-        add("OEBPS/content.xhtml", '<?xml version="1.0" encoding="utf-8"?><html xmlns="http://www.w3.org/1999/xhtml"><head><title>' .. esc(title) .. '</title><style type="text/css">.header {font-size: small;} img {max-width: 100%;}</style></head><body>' .. header .. body .. '</body></html>')
+        add("OEBPS/content.xhtml", '<?xml version="1.0" encoding="utf-8"?><html xmlns="http://www.w3.org/1999/xhtml"><head><title>' .. esc(title) .. '</title><style type="text/css">.header p { text-indent: 0; margin: 0; font-size: small; } .caption { font-size: small; text-align: center; } img { max-width: 100%; }</style></head><body>' .. header .. body .. '</body></html>')
         writer:close()
         if before_rename then before_rename(tmp) end
         assert(os.rename(tmp, path))
